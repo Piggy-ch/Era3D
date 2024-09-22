@@ -2,6 +2,7 @@ import inspect
 import warnings
 from typing import Callable, List, Optional, Union, Dict, Any
 import PIL
+from PIL import Image
 import torch
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, CLIPFeatureExtractor, CLIPTokenizer, CLIPTextModel
@@ -16,9 +17,65 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from diffusers.pipelines.stable_diffusion.stable_unclip_image_normalizer import StableUnCLIPImageNormalizer
 import os
+
 import torchvision.transforms.functional as TF
 from einops import rearrange
 logger = logging.get_logger(__name__)
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    **kwargs,
+):
+    """
+    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+    Args:
+        scheduler (`SchedulerMixin`):
+            The scheduler to get timesteps from.
+        num_inference_steps (`int`):
+            The number of diffusion steps used when generating samples with a pre-trained model. If used,
+            `timesteps` must be `None`.
+        device (`str` or `torch.device`, *optional*):
+            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+        timesteps (`List[int]`, *optional*):
+                Custom timesteps used to support arbitrary spacing between timesteps. If `None`, then the default
+                timestep spacing strategy of the scheduler is used. If `timesteps` is passed, `num_inference_steps`
+                must be `None`.
+
+    Returns:
+        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        second element is the number of inference steps.
+    """
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
+
+def retrieve_latents(
+    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+    ):
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
 
 class StableUnCLIPImg2ImgPipeline(DiffusionPipeline):
     """
@@ -112,6 +169,15 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline):
         computing decoding in one step.
         """
         self.vae.disable_slicing()
+    
+    def get_timesteps(self, num_inference_steps, strength, device):
+        # get the original timestep using init_timestep
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
+
+        return timesteps, num_inference_steps - t_start
 
     def enable_sequential_cpu_offload(self, gpu_id=0):
         r"""
@@ -372,12 +438,55 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline):
 
         return image_embeds
 
+
+    
+    def prepare_latents_image(self, image, timestep, batch_size, num_images_per_prompt, dtype, device, generator=None):
+        if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
+            raise ValueError(
+                f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
+            )
+
+        image = image.to(device=device, dtype=dtype)
+
+        batch_size = batch_size * num_images_per_prompt
+
+        if image.shape[1] == 4:
+            init_latents = image
+
+        else:
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+
+            elif isinstance(generator, list):
+                init_latents = [
+                    retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i])
+                    for i in range(batch_size)
+                ]
+                init_latents = torch.cat(init_latents, dim=0)
+            else:
+                init_latents = retrieve_latents(self.vae.encode(image), generator=generator)
+
+            init_latents = self.vae.config.scaling_factor * init_latents
+        shape = init_latents.shape
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+        # get latents
+        init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
+        latents = init_latents
+
+        return latents
+
     @torch.no_grad()
     # @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
         image: Union[torch.FloatTensor, PIL.Image.Image],
-        prompt: Union[str, List[str]],   
+        prompt: Union[str, List[str]],
+        strength: float = 0.8,
+        image_gt: Union[torch.FloatTensor, PIL.Image.Image] = None,   
         prompt_embeds: torch.FloatTensor = None,
         dino_feature: torch.FloatTensor = None,
         height: Optional[int] = None,
@@ -496,7 +605,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline):
         if isinstance(image, list):
             batch_size = len(image)
         elif isinstance(image, torch.Tensor):
-            batch_size = image.shape[0]
+            batch_size = image.shape[0] #B*NV*2
             assert batch_size >= self.num_views and batch_size % self.num_views == 0
         elif isinstance(image, PIL.Image.Image):
             image = [image]*self.num_views*2
@@ -544,13 +653,31 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline):
         )
 
         # 5. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        if  image_gt == None:
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps = self.scheduler.timesteps
+        else:
+            timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device)
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+            latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+
 
         # 6. Prepare latent variables
         num_channels_latents = self.unet.config.out_channels
-        if gt_img_in is not None:
-            latents = gt_img_in * self.scheduler.init_noise_sigma
+        if image_gt is not None:
+            # latents = gt_img_in * self.scheduler.init_noise_sigma
+            
+            image_gt = self.image_processor.preprocess(image_gt)
+            latents = self.prepare_latents_image(
+                image_gt,
+                latent_timestep,
+                batch_size ,
+                num_images_per_prompt,
+                prompt_embeds.dtype,
+                device,
+                generator
+            )
+            
         else:
             latents = self.prepare_latents(
                 batch_size=batch_size,
@@ -610,6 +737,23 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline):
 
             if callback is not None and i % callback_steps == 0:
                 callback(i, t, latents)
+            # if i%5==0:
+            #     # 9. Post-processing
+            #     if not output_type == "latent":
+            #         if num_channels_latents == 8:
+            #             latents = torch.cat([latents[:, :4], latents[:, 4:]], dim=0)
+            #         with torch.no_grad():
+            #             image_ = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            #     else:
+            #         image_ = latents
+
+            #     image_ = self.image_processor.postprocess(image_, output_type=output_type)
+            #     image_numpy = image_.cpu().float()
+            #     import numpy as np
+            #     image_pil = [TF.to_pil_image(image_numpy[i]) for i in range(image_numpy.shape[0])]
+            #     for k in range(image_numpy.shape[0]):
+            #         image_pil[k].save(f"image_{t}_{k}.png")
+
 
         # 9. Post-processing
         if not output_type == "latent":

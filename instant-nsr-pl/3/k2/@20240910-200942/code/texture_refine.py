@@ -161,7 +161,7 @@ if __name__ == '__main__':
                     'A_bulldog_with_a_black_pirate_hat_rgba', 
                     '../examples',
                     '../mv_res',
-                    'recon/A_bulldog_with_a_black_pirate_hat_rgba/@20240910-201425/save', 
+                    'recon/A_bulldog_with_a_black_pirate_hat_rgba/@20240514-221419/save', 
                     'recon', 
                     torch.device('cuda:0'))
 
